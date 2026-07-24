@@ -530,29 +530,63 @@ func (r *ServerRegistry) GetOrLoadServer(ctx context.Context, serverName string)
 		return nil, fmt.Errorf("server config not found: %s", serverName)
 	}
 
-	// Create the MCP client
-	mcpClient, err := client.NewMCPClient(serverName, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MCP client: %w", err)
-	}
+	// Retry create→start→initialize with exponential backoff.
+	// Catches transient stdio failures: slow subprocess startup, banner-corrupted
+	// initialize handshake, brief SSH glitches in remote-wrapped servers, etc.
+	// Without retry, one transient failure permanently disables the server until
+	// the proxy itself restarts.
+	var (
+		mcpClient *client.Client
+		lastErr   error
+	)
+	const maxRetries = 3
+	backoffs := []time.Duration{1 * time.Second, 3 * time.Second, 9 * time.Second}
 
-	// Start the client if needed
-	if mcpClient.NeedManualStart() {
-		err := mcpClient.GetClient().Start(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to start MCP client: %w", err)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Retrying MCP client init for %s (attempt %d/%d, after %v): %v",
+				serverName, attempt+1, maxRetries, backoffs[attempt-1], lastErr)
+			time.Sleep(backoffs[attempt-1])
+			if mcpClient != nil {
+				_ = mcpClient.Close()
+				mcpClient = nil
+			}
 		}
+
+		var createErr error
+		mcpClient, createErr = client.NewMCPClient(serverName, cfg)
+		if createErr != nil {
+			lastErr = fmt.Errorf("failed to create MCP client: %w", createErr)
+			continue
+		}
+
+		if mcpClient.NeedManualStart() {
+			if startErr := mcpClient.GetClient().Start(ctx); startErr != nil {
+				lastErr = fmt.Errorf("failed to start MCP client: %w", startErr)
+				continue
+			}
+		}
+
+		initRequest := mcp.InitializeRequest{}
+		initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+		initRequest.Params.ClientInfo = mcp.Implementation{Name: "mcp-proxy-recursive"}
+		initRequest.Params.Capabilities = mcp.ClientCapabilities{}
+
+		if _, initErr := mcpClient.GetClient().Initialize(ctx, initRequest); initErr != nil {
+			lastErr = fmt.Errorf("failed to initialize MCP client: %w", initErr)
+			continue
+		}
+
+		// Success
+		lastErr = nil
+		break
 	}
 
-	// Initialize the client
-	initRequest := mcp.InitializeRequest{}
-	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-	initRequest.Params.ClientInfo = mcp.Implementation{Name: "mcp-proxy-recursive"}
-	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
-
-	_, err = mcpClient.GetClient().Initialize(ctx, initRequest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize MCP client: %w", err)
+	if lastErr != nil {
+		if mcpClient != nil {
+			_ = mcpClient.Close()
+		}
+		return nil, fmt.Errorf("after %d attempts: %w", maxRetries, lastErr)
 	}
 
 	log.Printf("Created and initialized MCP client for server: %s", serverName)
